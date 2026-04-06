@@ -279,7 +279,7 @@ const SUPS=["City Group", "Teer", "Meghna Group", "Fresh", "TK Group", "Pusti", 
 const STAFF={"receivers": ["Idris", "Al-Amin", "Mintu", "Harun", "Nilu", "Babu", "Sirajul", "Samsu", "Jilani", "Rumana", "Jabed", "Alam"], "buyers": ["Al-Amin", "Harun", "Mintu", "Nilu", "Babu", "Sirajul", "Alam", "Jabed"]};
 
 const FD=INGR.flatMap(x=>[x.name,...x.aliases].map(v=>({display:x.name,dept:x.dept,variant:v})));
-const fz=new Fuse(FD,{keys:['variant'],threshold:0.45,includeScore:true,minMatchCharLength:2});
+const fz=new Fuse(FD,{keys:['variant'],threshold:0.55,includeScore:true,minMatchCharLength:2});
 
 let sess=[]; // {uid, raw, matched, score, qty, unit, price, confirmed}
 let uidSeq=0;
@@ -412,53 +412,214 @@ async function procImg(f){
 }
 
 // ===== PARSE =====
-const SKIP_LINES=/^(paid|unpaid|recei|purchas|total|date|name|address|mobile|phone|time|sign|made by|check by|তারিখ|নাম|ঠিকানা|মোবাইল|স্বাক্ষর)/i;
+// ===== BENGALI NUMERAL CONVERTER =====
+function bn2num(s){return s.replace(/[০-৯]/g,c=>String.fromCharCode(c.charCodeAt(0)-2486+48));}
+
+// ===== BENGALI OCR NORMALIZER =====
+function normBn(s){
+  // Fix common Tesseract Bengali OCR errors
+  return s
+    .replace(/\s+/g,' ')
+    .replace(/ী/g,'ি')       // long-i → short-i (common OCR swap)
+    .replace(/ূ/g,'ু')       // long-u → short-u
+    .replace(/ৃ/g,'র')       // ri → ro
+    .replace(/ঃ/g,'')        // visarga removal
+    .replace(/়/g,'')         // nukta removal (often noise)
+    .replace(/\u200c|\u200d/g,'')  // zero-width chars
+    .replace(/[।|!৷]/g,'')   // sentence enders
+    .replace(/\/[-=]/g,' ')   // /-  /= → space
+    .replace(/[-=]+$/,'')     // trailing - =
+    .trim();
+}
+
+// ===== EXPANDED SKIP LINES =====
+const SKIP_LINES=/^(paid|unpaid|recei|purchas|total|sub.?total|grand|date|name|address|mobile|phone|time|sign|made by|check by|invoice|memo|cash|credit|balance|চালান|বিল|তারিখ|ঠিকানা|মোবাইল|স্বাক্ষর|নাম ও|ক্যাশ|জমা|বকেয়া|হিসাব)/i;
+
+// ===== BENGALI UNIT PATTERNS =====
+const BN_UNITS=/(?:কেজি|কে\.জি|কেঃজি|গ্রাম|গ্রাঃ|পিস|পিঃ|ডজন|লিটার|লিঃ|ব্যাগ|বক্স|টিন|রিম|রোল)/;
+
+// ===== MAIN PARSER (v2 — Bengali-aware) =====
 function parseInvoice(txt){
-  const lines=txt.split('\n').map(l=>l.trim()).filter(l=>l.length>2);
+  // Normalize: convert Bengali digits, fix OCR artifacts
+  txt=bn2num(txt);
+  
+  const rawLines=txt.split('\n').map(l=>l.trim()).filter(l=>l.length>2);
+  
+  // Split lines further: Bengali invoices often have multiple items per line
+  const lines=[];
+  for(const rl of rawLines){
+    // Split on Bengali comma/separator patterns
+    const parts=rl.split(/[,،।;]+/).map(p=>p.trim()).filter(p=>p.length>2);
+    if(parts.length>1) lines.push(...parts);
+    else lines.push(rl);
+  }
+  
   // Auto-detect supplier
   const lc=txt.toLowerCase();
-  for(const s of SUPS){if(lc.includes(s.toLowerCase())){document.getElementById('supsel').value=s;break;}}
-  // Detect paid status
-  if(/unpaid/i.test(txt)){paidSt='unpaid';updPaidBtn();}
-  else if(/paid/i.test(txt)){paidSt='paid';updPaidBtn();}
-  const items=[];
-  const qr=/(\d+[\.,]?\d*)\s*(kg|kgs|g|gm|gram|pcs|pc|piece|dz|dozen|ltr|liter|bag|box|tin|rim|roll|কেজি|গ্রাম|পিস|ডজন|লিটার)/i;
-  for(const line of lines){
-    if(line.length<3)continue;
-    if(/^[\d\s\-\.৳=×x*]+$/.test(line))continue;
-    if(SKIP_LINES.test(line))continue;
-    const m=mtch(line);
-    if(m&&m.score<0.5){
-      const qm=line.match(qr);
-      const nums=(line.match(/\d{2,6}/g)||[]).map(Number).filter(n=>n>0);
-      items.push({
-        uid:++uidSeq,raw:line,matched:m.item,score:m.score,
-        qty:qm?parseFloat(qm[1].replace(',','.')):null,
-        unit:qm?nuUnit(qm[2]):'KG',
-        price:nums.length?Math.max(...nums):null,
-        confirmed:false
-      });
+  const normTxt=normBn(txt);
+  for(const s of SUPS){
+    if(lc.includes(s.toLowerCase())||normTxt.includes(normBn(s))){
+      document.getElementById('supsel').value=s;break;
     }
   }
+  
+  // Detect paid status
+  if(/unpaid|বকেয়া|বাকি/i.test(txt)){paidSt='unpaid';updPaidBtn();}
+  else if(/paid|পরিশোধ|জমা/i.test(txt)){paidSt='paid';updPaidBtn();}
+  
+  const items=[];
+  
+  // Combined qty+unit regex (English + Bengali + Romanized Bengali)
+  const qr=/(\d+[\.,]?\d*)\s*(kg|kgs|g|gm|gram|pcs|pc|piece|pieces|dz|dozen|ltr|liter|litre|bag|box|tin|rim|roll|কেজি|কে\.জি|গ্রাম|পিস|ডজন|লিটার|hali|হালি)/i;
+  
+  // Price patterns: "120/-" "৳120" "120 tk" "120 taka" "120 টাকা" 
+  const priceRe=/(?:৳|tk\.?|taka|টাকা)?\s*(\d{2,6})(?:\s*(?:৳|tk|taka|টাকা|\/[-=]?))?/gi;
+
+  for(const line of lines){
+    if(line.length<3)continue;
+    if(/^[\d\s\-\.৳=×x*\/]+$/.test(line))continue; // pure number line
+    if(SKIP_LINES.test(line))continue;
+    
+    // === STRATEGY 1: Full line match ===
+    let m=mtch(line);
+    if(m&&m.score<0.6){
+      const parsed=extractQtyPrice(line,qr,priceRe);
+      items.push({uid:++uidSeq,raw:line,matched:m.item,score:m.score,...parsed,confirmed:false});
+      continue;
+    }
+    
+    // === STRATEGY 2: Word-level matching (critical for Bengali OCR) ===
+    const words=line.split(/\s+/);
+    let found=false;
+    
+    // Try bigrams first (e.g. "সয়াবিন তেল" = 2 words)
+    for(let i=0;i<words.length-1;i++){
+      const bigram=words[i]+' '+words[i+1];
+      const bm=mtch(bigram);
+      if(bm&&bm.score<0.5){
+        const parsed=extractQtyPrice(line,qr,priceRe);
+        items.push({uid:++uidSeq,raw:line,matched:bm.item,score:bm.score,...parsed,confirmed:false});
+        found=true;break;
+      }
+    }
+    if(found)continue;
+    
+    // Try individual words (e.g. "পেঁয়াজ" alone)
+    for(const w of words){
+      if(w.length<2)continue;
+      if(/^\d+$/.test(w))continue; // skip pure numbers
+      const wm=mtch(w);
+      if(wm&&wm.score<0.45){
+        const parsed=extractQtyPrice(line,qr,priceRe);
+        items.push({uid:++uidSeq,raw:line,matched:wm.item,score:wm.score,...parsed,confirmed:false});
+        found=true;break;
+      }
+    }
+    if(found)continue;
+    
+    // === STRATEGY 3: Bengali-normalized match ===
+    const normLine=normBn(line);
+    if(normLine!==line){
+      const nm=mtch(normLine);
+      if(nm&&nm.score<0.6){
+        const parsed=extractQtyPrice(line,qr,priceRe);
+        items.push({uid:++uidSeq,raw:line,matched:nm.item,score:nm.score,...parsed,confirmed:false});
+        continue;
+      }
+      // Also try normalized words
+      const nWords=normLine.split(/\s+/);
+      for(const nw of nWords){
+        if(nw.length<2||/^\d+$/.test(nw))continue;
+        const nwm=mtch(nw);
+        if(nwm&&nwm.score<0.45){
+          const parsed=extractQtyPrice(line,qr,priceRe);
+          items.push({uid:++uidSeq,raw:line,matched:nwm.item,score:nwm.score,...parsed,confirmed:false});
+          found=true;break;
+        }
+      }
+      if(found)continue;
+    }
+    
+    // === STRATEGY 4: Line has Bengali unit keyword → likely an item line ===
+    if(BN_UNITS.test(line)||/\d+\s*(kg|pcs|ltr|dozen)/i.test(line)){
+      // Force fuzzy search at higher threshold
+      const fm=mtch(line.replace(/[\d৳\/\-=]+/g,' ').trim());
+      if(fm&&fm.score<0.7){
+        const parsed=extractQtyPrice(line,qr,priceRe);
+        items.push({uid:++uidSeq,raw:line,matched:fm.item,score:fm.score,...parsed,confirmed:false});
+      }
+    }
+  }
+  
   // Detect total for reference
-  const tm=txt.match(/(?:total|মোট)[^\d]*(\d{3,6})/i);
+  const tm=txt.match(/(?:total|মোট|সর্বমোট|grand)[^\d]*(\d{3,7})/i);
   if(tm)document.getElementById('invnum').placeholder='Inv # | OCR Total: ৳'+tm[1];
+  
   rendParsed(items);
 }
+
+// ===== EXTRACT QTY + PRICE FROM LINE =====
+function extractQtyPrice(line,qr,priceRe){
+  const qm=line.match(qr);
+  const qty=qm?parseFloat(qm[1].replace(',','.')):null;
+  const unit=qm?nuUnit(qm[2]):'KG';
+  
+  // Extract all numbers that could be prices
+  const allNums=[...line.matchAll(/(\d{2,6})/g)].map(m=>Number(m[1])).filter(n=>n>0);
+  // Price is typically the largest number (or second if qty is larger)
+  let price=null;
+  if(allNums.length===1)price=allNums[0];
+  else if(allNums.length>=2){
+    // If we have qty, price is the OTHER number(s)
+    const priceNums=qty?allNums.filter(n=>n!==qty):allNums;
+    price=priceNums.length?Math.max(...priceNums):Math.max(...allNums);
+  }
+  
+  return {qty,unit,price};
+}
+
+// ===== MATCH FUNCTION (v2 — multi-strategy) =====
 function mtch(q){
   const lq=q.toLowerCase().trim();
+  if(!lq||lq.length<2)return null;
+  
+  // 1. Exact learned mapping
   if(lrn[lq])return{item:lrn[lq],score:0};
+  
+  // 2. First-2-word learned mapping
   const w2=lq.split(/\s+/).slice(0,2).join(' ');
-  if(lrn[w2])return{item:lrn[w2],score:0.05};
+  if(w2!==lq&&lrn[w2])return{item:lrn[w2],score:0.05};
+  
+  // 3. Bengali-normalized learned mapping
+  const nq=normBn(lq);
+  if(nq!==lq&&lrn[nq])return{item:lrn[nq],score:0.02};
+  
+  // 4. Fuse search (main)
   const r=fz.search(q);
-  return r.length?{item:r[0].item.display,score:r[0].score}:null;
+  if(r.length)return{item:r[0].item.display,score:r[0].score};
+  
+  // 5. Normalized Fuse search
+  if(nq!==lq){
+    const r2=fz.search(nq);
+    if(r2.length)return{item:r2[0].item.display,score:r2[0].score+0.05};
+  }
+  
+  return null;
 }
+
+// ===== UNIT NORMALIZER (expanded) =====
 function nuUnit(u){
-  const m={kg:'KG',kgs:'KG',g:'G',gm:'G',gram:'G',pcs:'PCS',pc:'PCS',piece:'PCS',dz:'DOZEN',dozen:'DOZEN',ltr:'LTR',liter:'LTR',bag:'BAG',box:'BOX',tin:'TIN',rim:'RIM',roll:'ROLL','কেজি':'KG','গ্রাম':'G','পিস':'PCS','ডজন':'DOZEN','লিটার':'LTR'};
+  const m={
+    kg:'KG',kgs:'KG',g:'G',gm:'G',gram:'G',pcs:'PCS',pc:'PCS',piece:'PCS',pieces:'PCS',
+    dz:'DOZEN',dozen:'DOZEN',ltr:'LTR',liter:'LTR',litre:'LTR',bag:'BAG',box:'BOX',
+    tin:'TIN',rim:'RIM',roll:'ROLL',hali:'HALI',
+    'কেজি':'KG','কে.জি':'KG','গ্রাম':'G','পিস':'PCS','ডজন':'DOZEN',
+    'লিটার':'LTR','ব্যাগ':'BAG','বক্স':'BOX','টিন':'TIN','রিম':'RIM','রোল':'ROLL','হালি':'HALI'
+  };
   return m[u.toLowerCase()]||u.toUpperCase();
 }
 
-// ===== RENDER PARSED — uses uid for bug-free operations =====
+
 function rendParsed(items){
   if(!items.length){document.getElementById('psec').style.display='none';return;}
   document.getElementById('psec').style.display='block';
