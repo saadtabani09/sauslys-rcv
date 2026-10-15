@@ -1,0 +1,25 @@
+name: receiving-integrity
+
+# Blocks regressions of the 2026-10-15 red-team findings: duplicate invoices,
+# mixed units, negative stock, missing sync/backup, CSV encoding.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Playwright
+        run: |
+          npm install --no-save --no-package-lock playwright@1.56.1
+          npx playwright install --with-deps chromium
+      - name: Receiving integrity regression test
+        run: node tests/repro_rcv_save.js "$GITHUB_WORKSPACE/index.html"

@@ -1,4 +1,4 @@
-const V = 'sauslys-rcv-v2';
+const V = 'sauslys-rcv-v3';
 const SHELL = [
   '/sauslys-rcv/',
   '/sauslys-rcv/index.html',

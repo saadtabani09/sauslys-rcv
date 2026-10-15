@@ -29,6 +29,8 @@ body{background:var(--bg);color:var(--t);font-family:var(--sa);min-height:100vh;
 .sbox{background:var(--s);border:1px solid var(--a);border-radius:8px;padding:18px;margin-bottom:14px;text-align:center}
 .stit{font-family:var(--mo);font-size:12px;color:var(--a);letter-spacing:2px;margin-bottom:6px}
 .ssub{font-size:12px;color:var(--m);margin-bottom:14px;line-height:1.5}
+.cntb{margin-left:8px;padding:3px 7px;font-family:var(--mo);font-size:9px;letter-spacing:1px;background:transparent;color:var(--a);border:1px solid var(--a);border-radius:4px;cursor:pointer}
+.syncst{font-family:var(--mo);font-size:10px;letter-spacing:1px;color:var(--m);margin:-2px 0 10px}
 .sbtn{width:100%;padding:13px;background:var(--a);color:#000;font-family:var(--mo);font-size:12px;font-weight:700;letter-spacing:2px;border:none;border-radius:6px;cursor:pointer}
 .sbtn:disabled{background:var(--b);color:var(--m);cursor:not-allowed}
 .pw2{margin-top:10px;display:none}
@@ -233,6 +235,13 @@ canvas{display:none}
       <button class="exbtn" onclick="expCSV()">⬇ CSV</button>
       <button class="wabtn" onclick="shareWA()">📤 WA</button>
     </div>
+    <div class="logtools">
+      <button class="exbtn" onclick="bkup()">💾 BACKUP</button>
+      <button class="exbtn" onclick="document.getElementById('rsf').click()">♻ RESTORE</button>
+      <button class="exbtn" onclick="syncSetup()">☁ SYNC</button>
+    </div>
+    <div class="syncst" id="syncst"></div>
+    <input type="file" id="rsf" accept="application/json,.json" style="display:none" onchange="rstr(this)">
     <input class="srch" id="srch" placeholder="Search supplier or item..." oninput="rl()">
     <div id="ll"></div>
   </div>
@@ -294,7 +303,7 @@ let flt='all',mhi=-1,dri=[];
 if('serviceWorker' in navigator)navigator.serviceWorker.register('./sw.js').catch(()=>{});
 
 window.addEventListener('load',()=>{
-  populateDDs();setToday();rl();rk();ri();usc();chkOCR();
+  populateDDs();setToday();rl();rk();ri();usc();chkOCR();syncSt();flushSync();
 });
 
 function populateDDs(){
@@ -642,9 +651,9 @@ function appendRow(item,tb){
     <input class="ied" data-uid="${item.uid}" data-f="matched" value="${esc(item.matched)}">
     <span class="mscore ${cls}">${sym} ${Math.round((1-item.score)*100)}%</span>
   </td>
-  <td><input class="qi" data-uid="${item.uid}" data-f="qty" type="number" step="0.1" value="${item.qty||''}"></td>
+  <td><input class="qi" data-uid="${item.uid}" data-f="qty" type="number" min="0" step="0.1" value="${item.qty||''}"></td>
   <td><select class="us" data-uid="${item.uid}" data-f="unit">${un.map(x=>`<option ${x===item.unit?'selected':''}>${x}</option>`).join('')}</select></td>
-  <td><input class="pri" data-uid="${item.uid}" data-f="price" type="number" value="${item.price||''}"></td>
+  <td><input class="pri" data-uid="${item.uid}" data-f="price" type="number" min="0" value="${item.price||''}"></td>
   <td>
     <button class="okbtn" data-uid="${item.uid}" onclick="conf(this)">OK</button>
     <button class="delbtn" data-uid="${item.uid}" onclick="delRow(this)">✕</button>
@@ -731,33 +740,130 @@ function clrSess(){
   document.getElementById('invnum').placeholder='Invoice # (optional)';
   updPaidBtn();setToday();usc();ucb();
 }
+// Units that convert into each other. Any other unit must match the unit the item is already tracked in.
+const UCONV={'G>KG':0.001,'KG>G':1000,'DOZEN>PCS':12,'PCS>DOZEN':1/12};
+function toBase(qty,unit,base){
+  const n=unit==='G'?{qty:qty/1000,unit:'KG'}:{qty,unit};
+  if(!base||base===n.unit)return n;
+  const f=UCONV[n.unit+'>'+base];
+  return f?{qty:n.qty*f,unit:base}:null;
+}
+const ikey=v=>String(v||'').trim().toLowerCase();
 function saveSess(){
   if(!sess.length)return;
   const sup=document.getElementById('supsel').value||'Unknown Supplier';
   const rec=document.getElementById('recsel').value||'';
   const buy=document.getElementById('buysel').value||'';
-  const num=document.getElementById('invnum').value||'';
+  const num=document.getElementById('invnum').value.trim();
   const dt=document.getElementById('invdate').value||new Date().toISOString().split('T')[0];
+  const errs=[],plan={};
+  sess.forEach(x=>{
+    const nm=x.matched||x.raw;
+    if(x.qty!=null&&!(x.qty>0))errs.push(nm+': quantity must be more than 0');
+    if(x.price!=null&&!(x.price>=0))errs.push(nm+': price cannot be negative');
+    if(x.matched&&x.qty>0){
+      const base=(inv[x.matched]&&inv[x.matched].unit)||plan[x.matched];
+      const b=toBase(x.qty,x.unit,base);
+      if(!b)errs.push(nm+': stock is tracked in '+base+' but this line is '+x.unit+'. Enter it in '+base+'.');
+      else{plan[x.matched]=b.unit;x._base=b;}
+    }
+  });
+  if(num&&lg.some(e=>ikey(e.supplier)===ikey(sup)&&ikey(e.invoiceNum)===ikey(num)))errs.push('Invoice #'+num+' from '+sup+' is already saved.');
+  if(errs.length){alert('NOT SAVED\n\n'+errs.join('\n'));return;}
+  const total=sess.reduce((s,x)=>s+(x.price||0),0);
+  if(total>0&&lg.some(e=>ikey(e.supplier)===ikey(sup)&&e.invoiceDate===dt&&e.total===total)&&
+     !confirm('A delivery from '+sup+' dated '+dt+' with the same total ৳'+total+' is already saved.\n\nSave this one too?'))return;
   const entry={
     id:Date.now(),date:new Date().toISOString(),invoiceDate:dt,invoiceNum:num,
     supplier:sup,receiver:rec,buyer:buy,paid:paidSt,
-    items:sess.map(x=>{return{name:x.matched,qty:x.qty,unit:x.unit,price:x.price}}),
-    total:sess.reduce((s,x)=>s+(x.price||0),0)
+    items:sess.map(x=>{return{name:x.matched,qty:x.qty,unit:x._base?x._base.unit:x.unit,qtyEntered:x.qty,unitEntered:x.unit,price:x.price}}),
+    total
   };
+  entry.items.forEach((it,i)=>{const b=sess[i]._base;if(b)it.qty=Math.round(b.qty*1000)/1000;});
   lg.unshift(entry);
   localStorage.setItem('sl_log',JSON.stringify(lg));
-  // Update stock
   sess.forEach(x=>{
-    if(x.matched&&x.qty){
-      if(!inv[x.matched])inv[x.matched]={qty:0,unit:x.unit};
-      const q=x.unit==='G'?x.qty/1000:x.qty;
-      inv[x.matched].qty=Math.round((inv[x.matched].qty+q)*1000)/1000;
-      if(x.unit!=='G')inv[x.matched].unit=x.unit;
+    if(x.matched&&x._base){
+      if(!inv[x.matched])inv[x.matched]={qty:0,unit:x._base.unit};
+      inv[x.matched].qty=Math.round((inv[x.matched].qty+x._base.qty)*1000)/1000;
     }
   });
   localStorage.setItem('sl_inv',JSON.stringify(inv));
-  clrSess();rl();ri();sw('log');
+  queueSync(entry);
+  sess=[];clrSess();rl();ri();sw('log');
 }
+
+// ===== SYNC + BACKUP: receiving data must not live only on this phone =====
+const RCV_VER='2026.10.15';
+let outbox=[];try{outbox=JSON.parse(localStorage.getItem('sl_outbox')||'[]')||[];}catch(e){outbox=[];}
+let syncing=false;
+function syncCfg(){try{return JSON.parse(localStorage.getItem('sl_sync')||'null');}catch(e){return null;}}
+function saveOutbox(){localStorage.setItem('sl_outbox',JSON.stringify(outbox));syncSt();}
+function queueSync(e){outbox.push({id:e.id,entry:e,tries:0});saveOutbox();flushSync();}
+async function flushSync(){
+  const c=syncCfg();
+  if(!c||!c.url||syncing||!outbox.length||!navigator.onLine){syncSt();return;}
+  syncing=true;
+  try{
+    for(const o of outbox.slice()){
+      const e=o.entry;
+      const body={created_at:e.date,store:'Factory',entry_type:'receiving',amount:String(e.total||0),app_version:'rcv-'+RCV_VER,
+        note:JSON.stringify({source:'sauslys-rcv',id:e.id,supplier:e.supplier,invoiceNum:e.invoiceNum,invoiceDate:e.invoiceDate,receiver:e.receiver,buyer:e.buyer,paid:e.paid,items:e.items})};
+      try{
+        const r=await fetch(c.url.replace(/\/+$/,'')+'/api/mobile/entries',{method:'POST',headers:{'Content-Type':'application/json','X-Sauslys-Access':c.key||''},body:JSON.stringify(body)});
+        if(!r.ok)throw new Error('HTTP '+r.status);
+        outbox=outbox.filter(x=>x.id!==o.id);
+        localStorage.setItem('sl_sync_last',new Date().toISOString());
+      }catch(err){o.tries=(o.tries||0)+1;o.err=String(err&&err.message||err);break;}
+    }
+  }finally{syncing=false;saveOutbox();}
+}
+function syncSt(){
+  const el=document.getElementById('syncst');if(!el)return;
+  const c=syncCfg(),last=localStorage.getItem('sl_bk_last');
+  const days=last?Math.floor((Date.now()-new Date(last).getTime())/864e5):null;
+  const on=!!(c&&c.url);
+  const s1=on?(outbox.length?'☁ '+outbox.length+' WAITING TO SYNC'+(outbox[0].err?' ('+outbox[0].err+')':''):'☁ ALL SYNCED'):'☁ SYNC OFF: DATA IS ONLY ON THIS PHONE';
+  const s2=days===null?'NO BACKUP YET':'BACKUP '+(days===0?'TODAY':days+'D AGO');
+  el.textContent=s1+' · '+s2;
+  el.style.color=(!on&&(days===null||days>1))||(on&&outbox.length>5)?'var(--r)':'';
+}
+function syncSetup(){
+  const c=syncCfg()||{};
+  const url=prompt('Sauslys ops server address (https://...). Leave empty to turn sync off.',c.url||'');
+  if(url===null)return;
+  if(url.trim()&&!/^https:\/\//i.test(url.trim())){alert('Use an https:// address.');return;}
+  if(!url.trim()){localStorage.removeItem('sl_sync');syncSt();return;}
+  const key=prompt('Access key for the ops server (ask the owner).',c.key||'');
+  if(key===null)return;
+  localStorage.setItem('sl_sync',JSON.stringify({url:url.trim(),key:key.trim()}));
+  syncSt();flushSync();
+}
+function bkup(){
+  const data={app:'sauslys-rcv',version:RCV_VER,exported:new Date().toISOString(),log:lg,stock:inv,learned:lrn,outbox,adjustments:JSON.parse(localStorage.getItem('sl_adj')||'[]')};
+  const name='SAUSLYS_RCV_BACKUP_'+new Date().toISOString().split('T')[0]+'.json';
+  const blob=new Blob([JSON.stringify(data)],{type:'application/json'});
+  const f=new File([blob],name,{type:'application/json'});
+  const dl=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);};
+  if(navigator.share&&navigator.canShare&&navigator.canShare({files:[f]}))navigator.share({files:[f],title:name}).catch(dl);else dl();
+  localStorage.setItem('sl_bk_last',new Date().toISOString());syncSt();
+}
+function rstr(inp){
+  const file=inp.files&&inp.files[0];inp.value='';if(!file)return;
+  const rd=new FileReader();
+  rd.onload=()=>{
+    let d;try{d=JSON.parse(rd.result);}catch(e){alert('Not a valid backup file.');return;}
+    if(!d||d.app!=='sauslys-rcv'||!Array.isArray(d.log)||!d.stock||typeof d.stock!=='object'){alert('Not a Sauslys RCV backup.');return;}
+    if(!confirm('Replace the data on this phone with the backup from '+String(d.exported||'?').slice(0,10)+' ('+d.log.length+' deliveries)?'))return;
+    lg=d.log;inv=d.stock;lrn=d.learned&&typeof d.learned==='object'?d.learned:lrn;outbox=Array.isArray(d.outbox)?d.outbox:[];
+    localStorage.setItem('sl_log',JSON.stringify(lg));localStorage.setItem('sl_inv',JSON.stringify(inv));localStorage.setItem('sl_lrn',JSON.stringify(lrn));
+    if(Array.isArray(d.adjustments))localStorage.setItem('sl_adj',JSON.stringify(d.adjustments));
+    saveOutbox();rl();ri();rk();alert('Restored '+lg.length+' deliveries.');
+  };
+  rd.readAsText(file);
+}
+window.addEventListener('online',flushSync);
+setInterval(flushSync,60000);
 
 // ===== LOG =====
 function fl(f,btn){flt=f;document.querySelectorAll('.fb').forEach(b=>b.classList.remove('active'));btn.classList.add('active');rl();}
@@ -771,10 +877,10 @@ function rl(){
   if(q)en=en.filter(e=>(e.supplier||'').toLowerCase().includes(q)||(e.invoiceNum||'').includes(q)||e.items.some(x=>(x.name||'').toLowerCase().includes(q)));
   if(!en.length){ll.innerHTML='<div class="em">NO DELIVERIES FOUND</div>';return;}
   ll.innerHTML=en.map(e=>`<div class="le">
-    <div class="lmeta"><span>${fd(e.date)}</span><span>${e.items.length} items<span class="lpaid ${e.paid||'paid'}">${(e.paid||'paid').toUpperCase()}</span></span></div>
+    <div class="lmeta"><span>${fd(e.date)}</span><span>${e.items.length} items<span class="lpaid ${e.paid==='unpaid'?'unpaid':'paid'}">${e.paid==='unpaid'?'UNPAID':'PAID'}</span></span></div>
     <div class="lsup">${esc(e.supplier)}${e.invoiceNum?' · #'+esc(e.invoiceNum):''}</div>
-    <div class="lstf">${[e.receiver?'RCV: '+e.receiver:'',e.buyer?'BUY: '+e.buyer:''].filter(Boolean).join(' · ')}</div>
-    ${e.items.map(x=>`<div class="lr"><span>${esc(x.name)}</span><span style="color:var(--m);font-family:var(--mo);font-size:10px">${x.qty!=null?x.qty+' '+x.unit:'—'}${x.price?' · ৳'+x.price:''}</span></div>`).join('')}
+    <div class="lstf">${[e.receiver?'RCV: '+esc(e.receiver):'',e.buyer?'BUY: '+esc(e.buyer):''].filter(Boolean).join(' · ')}</div>
+    ${e.items.map(x=>`<div class="lr"><span>${esc(x.name)}</span><span style="color:var(--m);font-family:var(--mo);font-size:10px">${x.qty!=null?esc(x.qty)+' '+esc(x.unit):'—'}${x.price?' · ৳'+esc(x.price):''}</span></div>`).join('')}
     ${e.total?`<div class="lt">TOTAL ৳${e.total.toLocaleString()}</div>`:''}
   </div>`).join('');
 }
@@ -818,9 +924,9 @@ function expXLSX(){
 }
 
 function expCSV(){
-  let csv='Date,Invoice Date,Invoice #,Supplier,Receiver,Buyer,Paid,Item,Qty,Unit,Price BDT\n';
+  let csv='\uFEFF'+'Date,Invoice Date,Invoice #,Supplier,Receiver,Buyer,Paid,Item,Qty,Unit,Price BDT\n';
   for(const e of lg)for(const x of e.items)
-    csv+=[fd(e.date),e.invoiceDate||'',e.invoiceNum||'',e.supplier,e.receiver||'',e.buyer||'',e.paid||'',x.name,x.qty!=null?x.qty:'',x.unit||'',x.price!=null?x.price:''].map(v=>`"${String(v||'').replace(/"/g,'""')}"`).join(',')+`\n`;
+    csv+=[fd(e.date),e.invoiceDate||'',e.invoiceNum||'',e.supplier,e.receiver||'',e.buyer||'',e.paid||'',x.name,x.qty!=null?x.qty:'',x.unit||'',x.price!=null?x.price:''].map(v=>{let c=String(v??'');if(/^[=+\-@\t\r]/.test(c))c="'"+c;return '"'+c.replace(/"/g,'""')+'"';}).join(',')+`\n`;
   const cb=new Blob([csv],{type:'text/csv;charset=utf-8'});const cn='SAUSLYS_RECEIVING_'+new Date().toISOString().split('T')[0]+'.csv';const cf=new File([cb],cn,{type:cb.type});if(navigator.share&&navigator.canShare&&navigator.canShare({files:[cf]})){navigator.share({files:[cf],title:cn}).catch(()=>{const a=document.createElement('a');a.href=URL.createObjectURL(cb);a.download=cn;a.click();});}else{const a=document.createElement('a');a.href=URL.createObjectURL(cb);a.download=cn;a.click();}
 }
 
@@ -844,13 +950,31 @@ function shareWA(){
 // ===== STOCK =====
 function ri(){
   const list=document.getElementById('invlist');
-  const en=Object.entries(inv).filter(([,v])=>v.qty>0).sort((a,b)=>a[0].localeCompare(b[0]));
+  const en=Object.entries(inv).filter(([,v])=>v.qty!==0).sort((a,b)=>a[0].localeCompare(b[0]));
   document.getElementById('invcount').textContent=en.length+' items tracked';
   if(!en.length){list.innerHTML='<div class="em">No stock tracked yet.<br>Save deliveries to build running stock.</div>';return;}
   list.innerHTML=en.map(([name,data])=>{
     const ig=INGR.find(x=>x.name===name);
-    return `<div class="invrow"><div><div class="invname">${esc(name)}</div><div class="invdept">${ig?ig.dept:'—'}</div></div><div class="invqty">${Math.round(data.qty*100)/100} ${data.unit||'KG'}</div></div>`;
+    return `<div class="invrow"><div><div class="invname">${esc(name)}</div><div class="invdept">${ig?ig.dept:'—'}</div></div><div class="invqty"${data.qty<0?' style="color:var(--r)"':''}>${Math.round(data.qty*100)/100} ${esc(data.unit||'KG')}<button class="cntb" data-n="${esc(name)}" onclick="cnt(this.dataset.n)">COUNT</button></div></div>`;
   }).join('');
+}
+// Physical count: sets one item's balance and unit, keeps an audit trail (sl_adj, included in backups).
+const BASE_UNITS=['KG','PCS','DOZEN','LTR','BAG','BOX','TIN','RIM','ROLL'];
+function cnt(name){
+  const cur=inv[name]||{qty:0,unit:'KG'};
+  const q=prompt('Physical count of '+name+'\nSystem shows '+cur.qty+' '+cur.unit+'.\n\nCounted quantity:','');
+  if(q===null)return;
+  const qty=parseFloat(q);
+  if(!(qty>=0)){alert('Enter a number, 0 or more.');return;}
+  const u=prompt('Unit for '+name+' ('+BASE_UNITS.join(', ')+'):',cur.unit||'KG');
+  if(u===null)return;
+  const unit=u.trim().toUpperCase();
+  if(!BASE_UNITS.includes(unit)){alert('Unit must be one of: '+BASE_UNITS.join(', '));return;}
+  let adj=[];try{adj=JSON.parse(localStorage.getItem('sl_adj')||'[]')||[];}catch(e){}
+  adj.unshift({name,before:{qty:cur.qty,unit:cur.unit},after:{qty,unit},at:new Date().toISOString()});
+  localStorage.setItem('sl_adj',JSON.stringify(adj));
+  inv[name]={qty:Math.round(qty*1000)/1000,unit};
+  localStorage.setItem('sl_inv',JSON.stringify(inv));ri();
 }
 function clrInv(){if(!confirm('Reset all stock to zero?'))return;inv={};localStorage.setItem('sl_inv',JSON.stringify(inv));ri();}
 
